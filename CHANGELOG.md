@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Work in remote development (JetBrains Gateway, Code With Me): serve the diagrams.net app through a per-browser request handler instead of a scheme handler registered on CefApp, which the remote client never sees (`ERR_UNKNOWN_URL_SCHEME`), and inject the host bridge with `CefBrowser.executeJavaScript`, as `CefFrame.executeJavaScript` is not supported there.
+
 ## 0.2.8 - 2026-08-14
 
 ### Fixed

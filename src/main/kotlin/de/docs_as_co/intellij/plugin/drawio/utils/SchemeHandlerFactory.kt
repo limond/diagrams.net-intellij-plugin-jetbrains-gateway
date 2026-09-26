@@ -15,7 +15,7 @@ import java.io.InputStream
 import java.net.URI
 
 class SchemeHandlerFactory(val getStream: (uri: URI) -> InputStream?) : CefSchemeHandlerFactory {
-    override fun create(browser: CefBrowser, frame: CefFrame, schemeName: String, request: CefRequest): CefResourceHandler {
+    override fun create(browser: CefBrowser?, frame: CefFrame?, schemeName: String?, request: CefRequest): CefResourceHandler {
         val uri = URI(request.url)
 
         val myStream = getStream(uri)

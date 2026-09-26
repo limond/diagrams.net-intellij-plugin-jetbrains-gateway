@@ -11,11 +11,15 @@ import de.docs_as_co.intellij.plugin.drawio.settings.DiagramsUiMode
 import de.docs_as_co.intellij.plugin.drawio.settings.DiagramsUiTheme
 import de.docs_as_co.intellij.plugin.drawio.utils.LoadableJCEFHtmlPanel
 import de.docs_as_co.intellij.plugin.drawio.utils.SchemeHandlerFactory
-import org.cef.CefApp
 import org.cef.browser.CefBrowser
 import org.cef.browser.CefFrame
-import org.cef.handler.CefLifeSpanHandlerAdapter
 import org.cef.handler.CefLoadHandlerAdapter
+import org.cef.handler.CefRequestHandlerAdapter
+import org.cef.handler.CefResourceHandler
+import org.cef.handler.CefResourceRequestHandler
+import org.cef.handler.CefResourceRequestHandlerAdapter
+import org.cef.misc.BoolRef
+import org.cef.network.CefRequest
 import org.jetbrains.concurrency.AsyncPromise
 import org.jetbrains.concurrency.Promise
 import java.net.URI
@@ -28,62 +32,50 @@ abstract class BaseDiagramsWebView(val lifetime: Lifetime, var uiTheme: String, 
             configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
         }
 
-        private var didRegisterSchemeHandler = false
         private var myUiTheme = DiagramsUiTheme.DEFAULT.key
         private var myUiMode = DiagramsUiMode.AUTO.key
-        private val schemeHandlerLock = Any()
+
+        private const val ORIGIN = "https://drawio-plugin"
 
         fun initializeSchemeHandler(uiTheme: String, uiMode: String) {
             // set new theme to private variable. Will be used when rendering the preview the next time
             myUiTheme = uiTheme
             myUiMode = uiMode
+        }
 
-            synchronized(schemeHandlerLock) {
-                if (didRegisterSchemeHandler) {
-                    return
+        // Serves the bundled diagrams.net app under https://drawio-plugin. "https" is needed as the scheme because a
+        // custom "drawio-plugin" scheme didn't allow the CORS requests diagrams.net needs to start (from IntelliJ
+        // 2021.1 onwards; error: "CORS policy: Cross origin requests are only supported for protocol schemes...").
+        private val assets = SchemeHandlerFactory { uri: URI ->
+            LOG.debug("Scheme handler: Requested URI: ${uri.path}")
+            if (uri.path == "/index.html") {
+                LOG.debug("Scheme handler: Serving index.html with initialData")
+                // Build initial data JSON manually to avoid Jackson reflection issues with local classes
+                val initialDataJson = """{"baseUrl":"$ORIGIN","localStorage":null,"theme":"$myUiTheme","mode":"$myUiMode","lang":"en","showChrome":"1"}"""
+
+                val text =
+                    BaseDiagramsWebView::class.java.getResourceAsStream("/assets/index.html")?.reader()
+                        ?.readText()
+                if (text == null) {
+                    LOG.error("Scheme handler: Failed to load /assets/index.html")
+                    null
+                } else {
+                    val updatedText = text.replace(
+                        "\$\$initialData\$\$",
+                        initialDataJson
+                    )
+                    LOG.debug("Scheme handler: index.html loaded, size: ${updatedText.length} bytes")
+                    updatedText.byteInputStream()
                 }
-
-                val registered = CefApp.getInstance().registerSchemeHandlerFactory(
-                    // needed to use "https" as scheme here as "drawio-plugin" scheme didn't allow for CORS requests that were needed
-                    // to start the diagrams.net application in the JCEF/Chromium preview browser.
-                    // Worked in previous versions, but not from IntelliJ 2021.1 onwards; maybe due to tightened security in Chromium.
-                    // Error message was: "CORS policy: Cross origin requests are only supported for protocol schemes..."
-                    "https", "drawio-plugin",
-                    SchemeHandlerFactory { uri: URI ->
-                        LOG.debug("Scheme handler: Requested URI: ${uri.path}")
-                        if (uri.path == "/index.html") {
-                            LOG.debug("Scheme handler: Serving index.html with initialData")
-                            // Build initial data JSON manually to avoid Jackson reflection issues with local classes
-                            val initialDataJson = """{"baseUrl":"https://drawio-plugin","localStorage":null,"theme":"$myUiTheme","mode":"$myUiMode","lang":"en","showChrome":"1"}"""
-
-                            val text =
-                                BaseDiagramsWebView::class.java.getResourceAsStream("/assets/index.html")?.reader()
-                                    ?.readText()
-                            if (text == null) {
-                                LOG.error("Scheme handler: Failed to load /assets/index.html")
-                                null
-                            } else {
-                                val updatedText = text.replace(
-                                    "\$\$initialData\$\$",
-                                    initialDataJson
-                                )
-                                LOG.debug("Scheme handler: index.html loaded, size: ${updatedText.length} bytes")
-                                updatedText.byteInputStream()
-                            }
-                        } else {
-                            LOG.debug("Scheme handler: Serving asset: /assets${uri.path}")
-                            val stream = BaseDiagramsWebView::class.java.getResourceAsStream("/assets" + uri.path)
-                            if (stream == null) {
-                                LOG.error("Scheme handler: Asset not found: /assets${uri.path}")
-                            } else {
-                                LOG.debug("Scheme handler: Asset found: /assets${uri.path}")
-                            }
-                            stream
-                        }
-                    }
-                )
-                check(registered) { "Unable to register the diagrams.net JCEF resource handler" }
-                didRegisterSchemeHandler = true
+            } else {
+                LOG.debug("Scheme handler: Serving asset: /assets${uri.path}")
+                val stream = BaseDiagramsWebView::class.java.getResourceAsStream("/assets" + uri.path)
+                if (stream == null) {
+                    LOG.error("Scheme handler: Asset not found: /assets${uri.path}")
+                } else {
+                    LOG.debug("Scheme handler: Asset found: /assets${uri.path}")
+                }
+                stream
             }
         }
     }
@@ -99,13 +91,26 @@ abstract class BaseDiagramsWebView(val lifetime: Lifetime, var uiTheme: String, 
 
     init {
         initializeSchemeHandler(uiTheme, uiMode)
-        object : CefLifeSpanHandlerAdapter() {
-            override fun onAfterCreated(browser: CefBrowser?) {
-                super.onAfterCreated(browser)
-                initializeSchemeHandler(uiTheme, uiMode)
+        // The app is served per browser by a request handler rather than by a scheme handler factory registered on
+        // CefApp: in remote development (JetBrains Gateway, Code With Me) the browser runs in the client, which only
+        // sees the handlers of its own browser, so a factory registered on the host's CefApp is never asked
+        // (ERR_UNKNOWN_URL_SCHEME). A per-browser handler works the same in a local IDE.
+        object : CefRequestHandlerAdapter() {
+            override fun getResourceRequestHandler(
+                browser: CefBrowser?, frame: CefFrame?, request: CefRequest?, isNavigation: Boolean,
+                isDownload: Boolean, requestInitiator: String?, disableDefaultHandling: BoolRef?,
+            ): CefResourceRequestHandler? {
+                if (request?.url?.startsWith("$ORIGIN/") != true) return null
+                return object : CefResourceRequestHandlerAdapter() {
+                    override fun getResourceHandler(browser: CefBrowser?, frame: CefFrame?, request: CefRequest): CefResourceHandler =
+                        assets.create(browser, frame, "https", request)
+                }
             }
         }.also { handler ->
-            panel.browser.jbCefClient.addLifeSpanHandler(handler, panel.browser.cefBrowser)
+            panel.browser.jbCefClient.addRequestHandler(handler, panel.browser.cefBrowser)
+            lifetime.onTermination {
+                panel.browser.jbCefClient.removeRequestHandler(handler, panel.browser.cefBrowser)
+            }
         }
         val jsRequestHandler = JBCefJSQuery.create(panel.browser).also { handler ->
             handler.addHandler { request: String ->
@@ -130,11 +135,14 @@ abstract class BaseDiagramsWebView(val lifetime: Lifetime, var uiTheme: String, 
         }
         object : CefLoadHandlerAdapter() {
             override fun onLoadEnd(browser: CefBrowser?, frame: CefFrame?, httpStatusCode: Int) {
-                frame?.executeJavaScript(
+                if (browser == null || frame?.isMain == false) return
+                // On the browser, not the frame: in remote development CefFrame.executeJavaScript is not supported
+                // (the host only logs "Not supported on backend"), CefBrowser.executeJavaScript is.
+                browser.executeJavaScript(
                         "window.sendMessageToHost = function(message) {" +
                                 jsRequestHandler.inject("message") +
                                 "};",
-                        frame.url, 0
+                        frame?.url ?: browser.url, 0
                 )
             }
         }.also { handler ->
@@ -143,7 +151,7 @@ abstract class BaseDiagramsWebView(val lifetime: Lifetime, var uiTheme: String, 
                 panel.browser.jbCefClient.removeLoadHandler(handler, panel.browser.cefBrowser)
             }
         }
-        panel.loadUrl("https://drawio-plugin/index.html")
+        panel.loadUrl("$ORIGIN/index.html")
     }
 
     private var requestId = 0
